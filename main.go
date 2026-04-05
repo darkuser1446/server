@@ -48,18 +48,22 @@ type LawoneResponse struct {
 }
 
 // ─────────────────────────────────────────
-// CORS MIDDLEWARE (FIXED)
+// FIX 1 — GLOBAL CORS MIDDLEWARE
+// Wraps the *entire* mux so headers are
+// written before ANY handler code runs.
+// A panicking handler can no longer strip them.
 // ─────────────────────────────────────────
 
-func corsMiddleware(next http.Handler) http.Handler {
+func globalCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
+		// Always write CORS headers first, unconditionally.
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
+		// Pre-flight — browser sends this before the real POST.
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 
@@ -68,13 +72,36 @@ func corsMiddleware(next http.Handler) http.Handler {
 }
 
 // ─────────────────────────────────────────
+// FIX 2 — PANIC RECOVERY MIDDLEWARE
+// If any handler panics the goroutine still
+// returns a proper JSON error (not a bare
+// TCP close which the browser blames on CORS).
+// ─────────────────────────────────────────
+
+func recoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("PANIC recovered: %v", rec)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(`{"error":"internal server error"}`))
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ─────────────────────────────────────────
 // GEMINI CALL
+// FIX 3 — safe nil checks so a bad Gemini
+// response can never cause a nil-pointer panic.
 // ─────────────────────────────────────────
 
 func callGemini(story string) (*VFT, error) {
-	apiKey := os.Getenv("GEMINI_API_KEY")
+	apiKey := os.Getenv("AIzaSyCb_UE-qzF2ZCDHtynGOkxGQiYUWeldp14")
 	if apiKey == "" {
-		apiKey = "AIzaSyCb_UE-qzF2ZCDHtynGOkxGQiYUWeldp14"
+		return nil, fmt.Errorf("GEMINI_API_KEY not set")
 	}
 
 	url := fmt.Sprintf(
@@ -82,55 +109,128 @@ func callGemini(story string) (*VFT, error) {
 		apiKey,
 	)
 
+	prompt := `Extract legal facts from the story below and return ONLY a valid JSON object with these exact keys:
+{
+  "entity": "name of the other party or Unknown",
+  "agreement": "brief description of the agreement or None",
+  "payment_made": "amount paid or None",
+  "performance": "Completed / Partial / Not started",
+  "has_receipt": "Yes / No / Unknown",
+  "notice_sent": "Yes / No"
+}
+Return ONLY the JSON object. No markdown, no explanation.
+
+Story:
+` + story
+
 	body := map[string]interface{}{
 		"contents": []map[string]interface{}{
 			{
 				"parts": []map[string]string{
-					{"text": "Extract legal facts as JSON.\n\nStory:\n" + story},
+					{"text": prompt},
 				},
 			},
 		},
 	}
 
-	bodyBytes, _ := json.Marshal(body)
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
 
-	for attempt := 1; attempt <= 2; attempt++ {
+	for attempt := 1; attempt <= 3; attempt++ {
 		resp, err := http.Post(url, "application/json", bytes.NewBuffer(bodyBytes))
 		if err != nil {
-			return nil, err
+			log.Printf("Gemini attempt %d — HTTP error: %v", attempt, err)
+			time.Sleep(time.Duration(attempt) * time.Second)
+			continue
 		}
 
 		respBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
-		var geminiResp map[string]interface{}
-		json.Unmarshal(respBytes, &geminiResp)
-
-		candidates := geminiResp["candidates"].([]interface{})
-		content := candidates[0].(map[string]interface{})["content"].(map[string]interface{})
-		parts := content["parts"].([]interface{})
-		rawText := parts[0].(map[string]interface{})["text"].(string)
-
-		rawText = strings.Trim(rawText, "` \n")
-
-		var vft VFT
-		err = json.Unmarshal([]byte(rawText), &vft)
-		if err == nil {
-			return &vft, nil
+		if resp.StatusCode != http.StatusOK {
+			log.Printf("Gemini attempt %d — status %d: %s", attempt, resp.StatusCode, string(respBytes))
+			time.Sleep(time.Duration(attempt) * time.Second)
+			continue
 		}
 
-		time.Sleep(1 * time.Second)
+		// ── Safe navigation (no type assertions that can panic) ──
+		var geminiResp map[string]interface{}
+		if err := json.Unmarshal(respBytes, &geminiResp); err != nil {
+			log.Printf("Gemini attempt %d — unmarshal error: %v", attempt, err)
+			time.Sleep(time.Duration(attempt) * time.Second)
+			continue
+		}
+
+		rawText, err := extractGeminiText(geminiResp)
+		if err != nil {
+			log.Printf("Gemini attempt %d — extract error: %v", attempt, err)
+			time.Sleep(time.Duration(attempt) * time.Second)
+			continue
+		}
+
+		// Strip markdown fences if Gemini added them anyway.
+		rawText = strings.TrimSpace(rawText)
+		rawText = strings.TrimPrefix(rawText, "```json")
+		rawText = strings.TrimPrefix(rawText, "```")
+		rawText = strings.TrimSuffix(rawText, "```")
+		rawText = strings.TrimSpace(rawText)
+
+		var vft VFT
+		if err := json.Unmarshal([]byte(rawText), &vft); err != nil {
+			log.Printf("Gemini attempt %d — VFT parse error: %v\nRaw: %s", attempt, err, rawText)
+			time.Sleep(time.Duration(attempt) * time.Second)
+			continue
+		}
+
+		return &vft, nil
 	}
 
-	return nil, fmt.Errorf("Gemini failed")
+	return nil, fmt.Errorf("Gemini failed after 3 attempts")
+}
+
+// extractGeminiText safely walks the Gemini response without panicking.
+func extractGeminiText(resp map[string]interface{}) (string, error) {
+	candidates, ok := resp["candidates"].([]interface{})
+	if !ok || len(candidates) == 0 {
+		return "", fmt.Errorf("no candidates in response")
+	}
+
+	candidate, ok := candidates[0].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("invalid candidate format")
+	}
+
+	content, ok := candidate["content"].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("no content in candidate")
+	}
+
+	parts, ok := content["parts"].([]interface{})
+	if !ok || len(parts) == 0 {
+		return "", fmt.Errorf("no parts in content")
+	}
+
+	part, ok := parts[0].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("invalid part format")
+	}
+
+	text, ok := part["text"].(string)
+	if !ok {
+		return "", fmt.Errorf("no text in part")
+	}
+
+	return text, nil
 }
 
 // ─────────────────────────────────────────
-// LOGIC
+// SCORING LOGIC
 // ─────────────────────────────────────────
 
 func buildLawoneScore(vft *VFT) LawoneResponse {
-	nodes := []LawoneNode{}
+	var nodes []LawoneNode
 	total := 0.0
 	missingQ := ""
 
@@ -192,32 +292,32 @@ func initDB(db *sql.DB) {
 }
 
 // ─────────────────────────────────────────
-// HANDLER
+// HANDLERS
 // ─────────────────────────────────────────
 
-func analyze(db *sql.DB) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
+func analyzeHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
 		var req StoryRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, `{"error":"invalid request"}`, 400)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Story) == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":"invalid or empty request"}`))
 			return
 		}
 
 		vft, err := callGemini(req.Story)
 		if err != nil {
-			http.Error(w, `{"error":"AI failed"}`, 500)
+			log.Printf("Gemini error: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error":"AI service failed — check GEMINI_API_KEY on Render"}`))
 			return
 		}
 
 		result := buildLawoneScore(vft)
-
 		db.Exec(`INSERT INTO cases (story, score) VALUES (?, ?)`, req.Story, result.LawoneScore)
-
 		json.NewEncoder(w).Encode(result)
-	})
+	}
 }
 
 // ─────────────────────────────────────────
@@ -236,12 +336,18 @@ func main() {
 	}
 	initDB(db)
 
-	http.Handle("/", corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("API Running 🚀"))
-	})))
+	mux := http.NewServeMux()
 
-	http.Handle("/analyze", corsMiddleware(analyze(db)))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("LAWONE API Running 🚀"))
+	})
 
-	log.Println("🚀 Running on port", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	mux.Handle("/analyze", analyzeHandler(db))
+
+	// Stack: globalCORS → recoveryMiddleware → mux
+	// CORS headers are set first, before any handler code can fail.
+	handler := globalCORS(recoveryMiddleware(mux))
+
+	log.Printf("🚀 Running on port %s", port)
+	log.Fatal(http.ListenAndServe(":"+port, handler))
 }
