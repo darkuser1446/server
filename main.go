@@ -48,6 +48,26 @@ type LawoneResponse struct {
 }
 
 // ─────────────────────────────────────────
+// CORS MIDDLEWARE (FIXED)
+// ─────────────────────────────────────────
+
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ─────────────────────────────────────────
 // GEMINI CALL
 // ─────────────────────────────────────────
 
@@ -62,14 +82,11 @@ func callGemini(story string) (*VFT, error) {
 		apiKey,
 	)
 
-	systemPrompt := `You are a legal fact extractor.
-Return ONLY valid JSON.`
-
 	body := map[string]interface{}{
 		"contents": []map[string]interface{}{
 			{
 				"parts": []map[string]string{
-					{"text": systemPrompt + "\n\nStory:\n" + story},
+					{"text": "Extract legal facts as JSON.\n\nStory:\n" + story},
 				},
 			},
 		},
@@ -115,25 +132,35 @@ Return ONLY valid JSON.`
 func buildLawoneScore(vft *VFT) LawoneResponse {
 	nodes := []LawoneNode{}
 	total := 0.0
+	missingQ := ""
 
 	if vft.Entity != "" && vft.Entity != "Unknown" {
 		total += 0.25
 		nodes = append(nodes, LawoneNode{"Node A", "Identity", "Verified", 0.25})
+	} else {
+		missingQ = "Who is the other party?"
+		nodes = append(nodes, LawoneNode{"Node A", "Identity", "Pending", 0})
 	}
 
 	if vft.PaymentMade != "" && vft.PaymentMade != "None" {
 		total += 0.25
 		nodes = append(nodes, LawoneNode{"Node B", "Payment", "Verified", 0.25})
+	} else {
+		nodes = append(nodes, LawoneNode{"Node B", "Payment", "Pending", 0})
 	}
 
 	if vft.Performance == "Partial" || vft.Performance == "Not started" {
 		total += 0.25
 		nodes = append(nodes, LawoneNode{"Node C", "Breach", "Verified", 0.25})
+	} else {
+		nodes = append(nodes, LawoneNode{"Node C", "Breach", "Pending", 0})
 	}
 
 	if vft.NoticeSent == "Yes" {
 		total += 0.25
 		nodes = append(nodes, LawoneNode{"Node D", "Notice", "Verified", 0.25})
+	} else {
+		nodes = append(nodes, LawoneNode{"Node D", "Notice", "Pending", 0})
 	}
 
 	strength := "Weak"
@@ -144,10 +171,11 @@ func buildLawoneScore(vft *VFT) LawoneResponse {
 	}
 
 	return LawoneResponse{
-		LawoneScore: total,
-		Strength:    strength,
-		Nodes:       nodes,
-		VFT:         vft,
+		LawoneScore:     total,
+		Strength:        strength,
+		Nodes:           nodes,
+		MissingQuestion: missingQ,
+		VFT:             vft,
 	}
 }
 
@@ -164,32 +192,23 @@ func initDB(db *sql.DB) {
 }
 
 // ─────────────────────────────────────────
-// HANDLERS
+// HANDLER
 // ─────────────────────────────────────────
 
-func cors(h http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+func analyze(db *sql.DB) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
-		if r.Method == "OPTIONS" {
-			return
-		}
-		h(w, r)
-	}
-}
-
-func analyze(db *sql.DB) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
 		var req StoryRequest
-		json.NewDecoder(r.Body).Decode(&req)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error":"invalid request"}`, 400)
+			return
+		}
 
 		vft, err := callGemini(req.Story)
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			http.Error(w, `{"error":"AI failed"}`, 500)
 			return
 		}
 
@@ -198,7 +217,7 @@ func analyze(db *sql.DB) http.HandlerFunc {
 		db.Exec(`INSERT INTO cases (story, score) VALUES (?, ?)`, req.Story, result.LawoneScore)
 
 		json.NewEncoder(w).Encode(result)
-	}
+	})
 }
 
 // ─────────────────────────────────────────
@@ -217,12 +236,12 @@ func main() {
 	}
 	initDB(db)
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	http.Handle("/", corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("API Running 🚀"))
-	})
+	})))
 
-	http.HandleFunc("/analyze", cors(analyze(db)))
+	http.Handle("/analyze", corsMiddleware(analyze(db)))
 
-	log.Println("Running on port", port)
-	http.ListenAndServe(":"+port, nil)
+	log.Println("🚀 Running on port", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
