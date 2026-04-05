@@ -99,13 +99,13 @@ func recoveryMiddleware(next http.Handler) http.Handler {
 // ─────────────────────────────────────────
 
 func callGemini(story string) (*VFT, error) {
-	apiKey := os.Getenv("AIzaSyCb_UE-qzF2ZCDHtynGOkxGQiYUWeldp14")
+	apiKey := os.Getenv("GEMINI_API_KEY")
 	if apiKey == "" {
 		return nil, fmt.Errorf("GEMINI_API_KEY not set")
 	}
 
 	url := fmt.Sprintf(
-		"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=%s",
+		"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=%s",
 		apiKey,
 	)
 
